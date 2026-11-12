@@ -71,6 +71,7 @@ jobs:
           for f in *.cpp; do
             "$CXX" -c "$f" -o "/tmp/out/obj/${f%.cpp}.o" \
               -I"$JNI" -std=c++17 -O2 -fPIC -fexceptions -frtti \
+              -DJNI_VERSION_1_8=0x00010008 \
               -Wno-everything &
             pids+=($!)
           done

@@ -1,0 +1,101 @@
+name: Build imgui-java natives for Android arm64
+
+# Builds libimgui-java64.so (Android / bionic / arm64-v8a) from upstream
+# SpaiR/imgui-java. Put this file in your own repo at:
+#   .github/workflows/build-android-arm64.yml
+# then run it from the Actions tab ("Run workflow"). No fork needed.
+#
+# How it works:
+#   1. Upstream's gradle task generates the JNI glue + collects all ImGui sources
+#      (it also builds an x86 Linux lib, which we ignore).
+#   2. We compile those same sources with the Android NDK clang for aarch64.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "SpaiR/imgui-java tag to build (must match the bundled binding)"
+        default: "v1.90.0"
+        required: true
+      api:
+        description: "Android API level"
+        default: "24"
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout upstream imgui-java
+        uses: actions/checkout@v4
+        with:
+          repository: SpaiR/imgui-java
+          ref: ${{ inputs.tag }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Generate JNI glue and collect sources (upstream gradle task)
+        run: |
+          set +e
+          # Vendor script only exists in some versions; FreeType is not needed.
+          ./gradlew imgui-binding:generateLibs -Denvs=linux -Dfreetype=false --no-daemon --stacktrace
+          echo "gradle exit code: $? (the x86 lib result does not matter; only the generated sources do)"
+          set -e
+          test -d /tmp/imgui/jni || { echo "::error::/tmp/imgui/jni was not generated"; exit 1; }
+          echo "Generated C++ files:"; ls /tmp/imgui/jni/*.cpp | wc -l
+          ls /tmp/imgui/jni | head -50
+
+      - name: Locate Android NDK
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
+          test -n "$NDK" -a -d "$NDK" || { echo "::error::NDK not found on runner"; exit 1; }
+          echo "NDK=$NDK" >> "$GITHUB_ENV"
+          echo "Using NDK at $NDK"
+
+      - name: Compile for arm64-v8a
+        run: |
+          set -euo pipefail
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CXX="$BIN/aarch64-linux-android${{ inputs.api }}-clang++"
+          test -x "$CXX"
+          JNI=/tmp/imgui/jni
+          mkdir -p /tmp/out/obj
+          cd "$JNI"
+          pids=()
+          for f in *.cpp; do
+            "$CXX" -c "$f" -o "/tmp/out/obj/${f%.cpp}.o" \
+              -I"$JNI" -std=c++17 -O2 -fPIC -fexceptions -frtti \
+              -Wno-everything &
+            pids+=($!)
+          done
+          fail=0
+          for p in "${pids[@]}"; do wait "$p" || fail=1; done
+          test $fail -eq 0
+          "$CXX" -shared -o /tmp/out/libimgui-java64.so /tmp/out/obj/*.o \
+            -static-libstdc++ -Wl,-z,max-page-size=16384 -Wl,--build-id=none -llog -ldl
+          "$BIN/llvm-strip" --strip-unneeded /tmp/out/libimgui-java64.so
+
+      - name: Verify
+        run: |
+          set -e
+          file /tmp/out/libimgui-java64.so
+          file /tmp/out/libimgui-java64.so | grep -q "ARM aarch64"
+          N=$("$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D /tmp/out/libimgui-java64.so | grep -c "Java_imgui_" || true)
+          echo "Exported JNI functions: $N"
+          test "$N" -gt 100
+          echo "Needed libs:"
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -d /tmp/out/libimgui-java64.so | grep NEEDED
+          ls -l /tmp/out/libimgui-java64.so
+          sha256sum /tmp/out/libimgui-java64.so
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libimgui-java64-android-arm64-${{ inputs.tag }}
+          path: /tmp/out/libimgui-java64.so
